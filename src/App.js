@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Heart, Play, RotateCcw, Home } from 'lucide-react';
 import { Button } from './components/Button';
 import { cn } from './lib/utils';
@@ -12,16 +12,49 @@ const App = () => {
   const [level, setLevel] = useState(1);
   const [lives, setLives] = useState(3);
   const [gameState, setGameState] = useState('start'); // 'start', 'showing', 'playing', 'gameOver', 'levelComplete'
-  const [gridSize, setGridSize] = useState(4); // 4x4 grid initially
+  const [gridSize, setGridSize] = useState(3); // 3x3 grid initially for level 1
   const [targetSquares, setTargetSquares] = useState(new Set());
   const [selectedSquares, setSelectedSquares] = useState(new Set());
   const [flashingSquares, setFlashingSquares] = useState(new Set());
   const [mistakes, setMistakes] = useState(0);
+  
+  // Animation state management
+  const [flippingSquares, setFlippingSquares] = useState(new Set());
+  const [selectingSquares, setSelectingSquares] = useState(new Set());
+  const [errorSquares, setErrorSquares] = useState(new Set()); // For red flash on 3 mistakes
 
-  // Calculate number of squares to flash based on level
+  // Ref to track active timeouts for cleanup
+  const timeoutsRef = useRef([]);
+
+  // Clear all active timeouts
+  const clearAllTimeouts = useCallback(() => {
+    timeoutsRef.current.forEach(timeoutId => clearTimeout(timeoutId));
+    timeoutsRef.current = [];
+  }, []);
+
+  // Helper function to create tracked timeouts
+  const createTimeout = useCallback((callback, delay) => {
+    const timeoutId = setTimeout(() => {
+      callback();
+      // Remove from tracking array when completed
+      timeoutsRef.current = timeoutsRef.current.filter(id => id !== timeoutId);
+    }, delay);
+    timeoutsRef.current.push(timeoutId);
+    return timeoutId;
+  }, []);
+
+  // Game progression
   const getSquaresToFlash = useCallback((currentLevel) => {
-    return Math.min(2 + currentLevel, gridSize * gridSize - 1);
-  }, [gridSize]);
+    return Math.min(2 + currentLevel, 25); // Start with 3, max 25
+  }, []);
+
+  const getGridSize = useCallback((currentLevel) => {
+    if (currentLevel <= 2) return 3;
+    if (currentLevel <= 5) return 4;
+    if (currentLevel <= 8) return 5;
+    if (currentLevel <= 13) return 6;
+    return 7;
+  }, []);
 
   // Generate random squares to flash
   const generateTargetSquares = useCallback(() => {
@@ -38,42 +71,76 @@ const App = () => {
 
   // Start a new level
   const startLevel = useCallback(() => {
-    setGameState('showing');
+    clearAllTimeouts();
+    
+    // Clear states
+    setFlashingSquares(new Set());
+    setFlippingSquares(new Set());
+    setSelectingSquares(new Set());
     setSelectedSquares(new Set());
+    setErrorSquares(new Set());
     setMistakes(0);
     
     const targets = generateTargetSquares();
     setTargetSquares(targets);
-    setFlashingSquares(targets);
+    setGameState('showing');
     
-    // Show pattern for 0.6 seconds (matching CSS animation), then start playing phase
-    setTimeout(() => {
-      setFlashingSquares(new Set());
-      setGameState('playing');
-    }, 600);
-  }, [generateTargetSquares]);
+    // Show pattern with animation
+    createTimeout(() => {
+      // First flip - start of reveal
+      setFlippingSquares(targets);
+      createTimeout(() => setFlashingSquares(targets), 50);
+      createTimeout(() => setFlippingSquares(new Set()), 250);
+      
+      // Second flip - end of reveal (same duration as start)
+      createTimeout(() => {
+        setFlippingSquares(targets);
+        createTimeout(() => setFlippingSquares(new Set()), 250);
+        createTimeout(() => {
+          setFlashingSquares(new Set());
+          setGameState('playing');
+        }, 50);
+      }, 1000); // Start second flip 1 second into the reveal
+    }, level === 1 ? 800 : 300);
+  }, [generateTargetSquares, level, clearAllTimeouts, createTimeout]);
 
-  // Handle square click during playing phase
-  const handleSquareClick = (squareIndex) => {
+  // Handle square click
+  const handleSquareClick = useCallback((squareIndex) => {
     if (gameState !== 'playing') return;
     
-    const newSelected = new Set(selectedSquares);
+    // Add selection animation
+    setSelectingSquares(prev => new Set(prev).add(squareIndex));
+    createTimeout(() => {
+      setSelectingSquares(prev => {
+        const updated = new Set(prev);
+        updated.delete(squareIndex);
+        return updated;
+      });
+    }, 200);
     
-    if (newSelected.has(squareIndex)) {
-      // Deselect if already selected
-      newSelected.delete(squareIndex);
-    } else {
-      // Select square
-      newSelected.add(squareIndex);
+    // Toggle selection with mistake tracking
+    setSelectedSquares(prev => {
+      const newSelected = new Set(prev);
+      const wasSelected = newSelected.has(squareIndex);
       
-      // Check if this square should be selected
-      if (!targetSquares.has(squareIndex)) {
-        setMistakes(prev => prev + 1);
+      if (wasSelected) {
+        // Deselecting - just remove it
+        newSelected.delete(squareIndex);
+      } else {
+        // Selecting - add it and check if it's wrong (but don't increment here)
+        newSelected.add(squareIndex);
       }
-    }
+      return newSelected;
+    });
     
-    setSelectedSquares(newSelected);
-  };
+    // Handle mistake increment separately to avoid double increment
+    if (!selectedSquares.has(squareIndex) && !targetSquares.has(squareIndex)) {
+      setMistakes(prev => {
+        console.log('Incrementing mistakes from', prev, 'to', prev + 1);
+        return prev + 1;
+      });
+    }
+  }, [gameState, selectedSquares, targetSquares, createTimeout]);
 
   // Check win/lose conditions
   useEffect(() => {
@@ -81,68 +148,76 @@ const App = () => {
     
     // Check if player lost a life (3 mistakes)
     if (mistakes >= 3) {
+      // Flash all wrong selections red
+      const wrongSelections = [...selectedSquares].filter(square => !targetSquares.has(square));
+      setErrorSquares(new Set(wrongSelections));
+      
+      // Clear red flash after animation
+      createTimeout(() => setErrorSquares(new Set()), 500);
+      
       const newLives = lives - 1;
       setLives(newLives);
       
       if (newLives <= 0) {
         setGameState('gameOver');
       } else {
-        // Reset level but keep progress
-        setTimeout(() => {
+        // Retry the same level, reset mistakes to 0
+        setGameState('showing');
+        createTimeout(() => {
+          setMistakes(0); // Reset mistakes when losing a life
           startLevel();
         }, 600);
       }
       return;
     }
     
-    // Check if level is complete (all correct squares selected, no wrong ones)
-    if (selectedSquares.size === targetSquares.size) {
-      let allCorrect = true;
-      for (const square of selectedSquares) {
-        if (!targetSquares.has(square)) {
-          allCorrect = false;
-          break;
-        }
-      }
-      
-      if (allCorrect) {
+    // Check level complete - all target squares must be selected (regardless of wrong selections)
+    if (selectedSquares.size > 0) {
+      const allTargetsSelected = [...targetSquares].every(square => selectedSquares.has(square));
+      if (allTargetsSelected) {
         setGameState('levelComplete');
-        
-        // Advance to next level after delay
-        setTimeout(() => {
-          const nextLevel = level + 1;
-          setLevel(nextLevel);
-          
-          // Increase grid size every 3 levels
-          if (nextLevel % 3 === 1 && nextLevel > 1) {
-            setGridSize(prev => Math.min(prev + 1, 6));
-          }
-          
+        createTimeout(() => {
+          setLevel(prev => prev + 1);
+          setGridSize(getGridSize(level + 1));
+          setMistakes(0); // Reset mistakes when passing a round
+          [setFlashingSquares, setSelectedSquares, setTargetSquares, setFlippingSquares, setSelectingSquares, setErrorSquares]
+            .forEach(setter => setter(new Set()));
           startLevel();
         }, 800);
       }
     }
-  }, [selectedSquares, targetSquares, mistakes, lives, gameState, level, startLevel]);
+  }, [selectedSquares, targetSquares, mistakes, lives, gameState, level, startLevel, getGridSize, createTimeout]);
 
-  // Start new game
+  // Cleanup effect to clear timeouts on unmount
+  useEffect(() => {
+    return () => {
+      clearAllTimeouts();
+    };
+  }, [clearAllTimeouts]);
+
+  // Game controls
   const startNewGame = () => {
+    clearAllTimeouts();
     setLevel(1);
     setLives(3);
-    setGridSize(4);
+    setGridSize(3);
     setMistakes(0);
+    [setFlashingSquares, setSelectedSquares, setTargetSquares, setFlippingSquares, setSelectingSquares, setErrorSquares]
+      .forEach(setter => setter(new Set()));
     startLevel();
   };
 
-  // Reset game
   const resetGame = () => {
+    clearAllTimeouts();
+    // Reset all game state to initial values
     setLevel(1);
     setLives(3);
-    setGridSize(4);
-    setGameState('start');
-    setTargetSquares(new Set());
-    setSelectedSquares(new Set());
-    setFlashingSquares(new Set());
+    setGridSize(3); // 3x3 grid for level 1
+    setGameState('start'); // Back to start screen
     setMistakes(0);
+    // Clear all square states
+    [setTargetSquares, setSelectedSquares, setFlashingSquares, setFlippingSquares, setSelectingSquares, setErrorSquares]
+      .forEach(setter => setter(new Set()));
   };
 
   // Heart icon component with modern styling
@@ -157,27 +232,31 @@ const App = () => {
     />
   );
 
-  // Calculate square size based on grid size to maintain consistent total area
+  // Calculate square size based on grid size
   const getSquareSize = useCallback(() => {
-    // Base size starts large for 4x4, gets smaller as grid grows
-    const baseSizes = {
-      4: 'w-20 h-20 sm:w-24 sm:h-24 md:w-28 md:h-28 lg:w-32 lg:h-32', // Large squares for 4x4
-      5: 'w-16 h-16 sm:w-20 sm:h-20 md:w-24 md:h-24 lg:w-26 lg:h-26', // Medium squares for 5x5
-      6: 'w-14 h-14 sm:w-16 sm:h-16 md:w-20 md:h-20 lg:w-22 lg:h-22', // Smaller squares for 6x6
+    const sizes = {
+      3: 'w-24 h-24 sm:w-28 sm:h-28 md:w-32 md:h-32 lg:w-36 lg:h-36', // Large for 3x3
+      4: 'w-20 h-20 sm:w-24 sm:h-24 md:w-28 md:h-28 lg:w-32 lg:h-32', // Medium for 4x4
+      5: 'w-16 h-16 sm:w-20 sm:h-20 md:w-24 md:h-24 lg:w-26 lg:h-26', // Small for 5x5
+      6: 'w-14 h-14 sm:w-16 sm:h-16 md:w-20 md:h-20 lg:w-22 lg:h-22', // Smaller for 6x6
+      7: 'w-12 h-12 sm:w-14 sm:h-14 md:w-16 md:h-16 lg:w-18 lg:h-18', // Smallest for 7x7
     };
-    return baseSizes[gridSize] || baseSizes[6];
+    return sizes[gridSize] || sizes[7];
   }, [gridSize]);
 
-  // Render game grid with improved responsive design
+  // Render game grid
   const renderGrid = () => {
     const squares = [];
-    const totalSquares = gridSize * gridSize;
     
-    for (let i = 0; i < totalSquares; i++) {
+    for (let i = 0; i < gridSize * gridSize; i++) {
       const isFlashing = flashingSquares.has(i);
       const isSelected = selectedSquares.has(i);
       const isTarget = targetSquares.has(i);
-      const isWrongSelection = isSelected && !isTarget && gameState === 'playing';
+      const isWrongSelection = isSelected && !isTarget;
+      const isCorrectSelection = isSelected && isTarget;
+      const isFlipping = flippingSquares.has(i);
+      const isSelecting = selectingSquares.has(i);
+      const isError = errorSquares.has(i);
       
       squares.push(
         <button
@@ -185,25 +264,23 @@ const App = () => {
           onClick={() => handleSquareClick(i)}
           disabled={gameState !== 'playing'}
           className={cn(
-            "game-square aspect-square rounded-xl border-2 square-transition transform",
+            "game-square aspect-square rounded-xl border-2 transition-all duration-150",
             "shadow-lg hover:shadow-xl focus:outline-none focus:ring-2 focus:ring-primary/50",
+            // Animations
+            isFlipping && "square-flip",
+            isSelecting && "square-select-flip",
             // Base styling
-            isFlashing 
-              ? "bg-primary border-primary shadow-primary/25" 
-              : "bg-secondary border-border",
-            // Selection states
-            isSelected && !isWrongSelection && "bg-green-600 border-green-500 shadow-green-500/25",
-            isWrongSelection && "bg-red-600 border-red-500 shadow-red-500/25",
+            isFlashing ? "bg-primary border-primary shadow-primary/25" : "bg-secondary border-border",
+            // Selection states - only show green if ALL targets are selected and no wrong selections
+            isCorrectSelection && mistakes === 0 && "bg-green-600 border-green-500 shadow-green-500/25",
+            isWrongSelection && !isError && "bg-gray-200 border-gray-300 shadow-gray-200/25", // Sort of white for incorrect
+            isError && "bg-red-500 border-red-400 shadow-red-500/25", // Red flash for mistakes
             // Interactive states
-            gameState === 'playing' && !isSelected && "hover:bg-accent hover:border-accent-foreground/20 hover:scale-105 active:scale-95",
+            gameState === 'playing' && !isSelected && "hover:bg-accent hover:border-accent-foreground/20 hover:scale-105",
             gameState !== 'playing' && "cursor-not-allowed opacity-60",
-            // Responsive sizing
             getSquareSize()
           )}
-        >
-          {/* Optional: Add subtle inner glow for better visual feedback */}
-          <div className="absolute inset-1 rounded-lg bg-gradient-to-br from-white/5 to-transparent pointer-events-none" />
-        </button>
+        />
       );
     }
     
@@ -260,12 +337,18 @@ const App = () => {
 
           {(gameState === 'showing' || gameState === 'playing' || gameState === 'levelComplete') && (
             <div className="space-y-6">
-              {/* Game instructions */}
-              <div className="text-center">
+              {/* Game instructions - fixed height container to prevent board jumping */}
+              <div className="text-center h-20 flex flex-col justify-center">
                 {gameState === 'showing' && (
-                  <p className="text-foreground text-lg md:text-xl font-semibold animate-pulse">
-                    Watch carefully! Memorize the flashing squares...
-                  </p>
+                  <div className="space-y-2">
+                    <p className="text-foreground text-lg md:text-xl font-semibold animate-pulse">
+                      Watch carefully! Memorize the flashing squares...
+                    </p>
+                    <div className="flex justify-center space-x-8 text-sm md:text-base text-muted-foreground">
+                      <span>Mistakes: {mistakes}/3</span>
+                      <span>Need to find: {targetSquares.size} squares</span>
+                    </div>
+                  </div>
                 )}
                 {gameState === 'playing' && (
                   <div className="space-y-2">
@@ -279,9 +362,15 @@ const App = () => {
                   </div>
                 )}
                 {gameState === 'levelComplete' && (
-                  <p className="text-green-400 text-lg md:text-xl font-semibold animate-bounce">
-                    Level Complete! Moving to next level...
-                  </p>
+                  <div className="space-y-2">
+                    <p className="text-green-400 text-lg md:text-xl font-semibold animate-bounce">
+                      Level Complete! Moving to next level...
+                    </p>
+                    <div className="flex justify-center space-x-8 text-sm md:text-base text-muted-foreground">
+                      <span>Mistakes: {mistakes}/3</span>
+                      <span>Need to find: {targetSquares.size} squares</span>
+                    </div>
+                  </div>
                 )}
               </div>
 
